@@ -1,0 +1,49 @@
+name: EoD Fetch (Yahoo -> Repo Cache)
+
+on:
+  schedule:
+    # Mon–Fri ~19:15 IST (13:45 UTC)
+    - cron: "45 13 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas
+
+      - name: Run fetcher
+        env:
+          HISTORY_DAYS: "420"
+          BATCH: "12"
+          RETRIES: "3"
+          SLEEP_BETWEEN: "2.0"
+        run: |
+          python .github/scripts/fetch_eod.py
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data/cache
+          git add data/cache/*.csv || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: EoD cache update [skip ci]"
+            git push
+          fi

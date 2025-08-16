@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from io import StringIO
+import io, zipfile, sys, os
 
 # Ensure local modules are importable on Streamlit Cloud
-import sys, os
 sys.path.append(os.path.dirname(__file__))
 
+# ---- Your local utils (as in your repo) ----
 from utils.data import fetch_many
 from utils.indicators import add_indicators
 from utils.filters import (
@@ -16,16 +16,17 @@ from utils.filters import (
     compute_score, merge_with_fundamentals, apply_fundamental_filters
 )
 
+# ------------------------- Page & Title -------------------------
 st.set_page_config(page_title='AI Stock Selection — EoD (Enhanced)', layout='wide')
 st.title('🧠 AI Stock Selection — EoD (Enhanced)')
 st.caption('Breakout+Volume and 52w Low Reversal strategies, with universe overrides and optional fundamentals.')
 
-# ------------------------- Sidebar controls -------------------------
+# ------------------------- Sidebar -------------------------
 with st.sidebar:
     st.header('Data Source')
     data_source = st.radio(
         'Choose',
-        options=['Live: Yahoo', 'Upload CSV (Manual)'],
+        options=['Live: Yahoo', 'Upload CSV (Manual)', 'Upload NSE Bhavcopy (CSV/ZIP)'],
         index=0
     )
 
@@ -48,10 +49,14 @@ with st.sidebar:
         pasted = st.text_area('Paste tickers (one per line, e.g., RELIANCE.NS)', value='')
         uni_file = st.file_uploader('Or upload a CSV with a "Ticker" column', type=['csv'])
         max_batch = st.slider('Max tickers to fetch this run', 5, 100, 15, 5)
-    else:
+    elif data_source == 'Upload CSV (Manual)':
         st.subheader('Upload one CSV per ticker')
         st.caption('Each file must have columns: Date, Open, High, Low, Close, Volume')
         csv_files = st.file_uploader('Upload CSV files', type=['csv'], accept_multiple_files=True)
+    else:
+        st.subheader('Bhavcopy Upload')
+        st.caption('Upload either: (a) one Equity Bhavcopy CSV for a single day, or (b) a ZIP containing many daily bhav CSVs.')
+        bhav_file = st.file_uploader('Upload Bhavcopy (CSV/ZIP)', type=['csv','zip'])
 
     st.markdown('---')
     st.subheader('Fundamental Filters (optional)')
@@ -74,9 +79,10 @@ def load_default_universe(path: str) -> pd.DataFrame:
 
 def build_data_map_from_csv_files(files) -> dict[str, pd.DataFrame]:
     """
-    Accepts a list of uploaded CSV files. Returns {ticker: df} dict.
-    The ticker name is derived from the filename (before .csv).
-    Required cols: Date, Open, High, Low, Close, Volume.
+    Accepts a list of uploaded per-ticker CSV files.
+    Returns {ticker: df(Date-indexed OHLCV)}.
+    Required cols: Date, Open, High, Low, Close, Volume
+    Ticker inferred from filename (before .csv).
     """
     out = {}
     for f in files:
@@ -84,36 +90,99 @@ def build_data_map_from_csv_files(files) -> dict[str, pd.DataFrame]:
             name = f.name
             ticker = os.path.splitext(name)[0]
             df = pd.read_csv(f)
-            # Normalize columns
-            cols = {c.strip().lower(): c for c in df.columns}
+
+            # Normalize headers
+            norm = {c.strip().lower(): c for c in df.columns}
+            def has_cols(cols):
+                lower = [x.strip().lower() for x in df.columns]
+                return all(c in lower for c in cols)
+
             need = ['date','open','high','low','close','volume']
-            if not all(c in [x.strip().lower() for x in df.columns] for c in ['Date','Open','High','Low','Close','Volume']):
-                # try to map lower-case keys
-                if not all(k in cols for k in need):
+            if not has_cols(['Date','Open','High','Low','Close','Volume']):
+                if not all(k in norm for k in need):
                     st.warning(f"{name}: missing required columns. Found {list(df.columns)}")
                     continue
-                df = df.rename(columns={cols['date']: 'Date', cols['open']: 'Open', cols['high']: 'High',
-                                        cols['low']: 'Low', cols['close']: 'Close', cols['volume']: 'Volume'})
+                df = df.rename(columns={
+                    norm['date']: 'Date', norm['open']: 'Open', norm['high']: 'High',
+                    norm['low']: 'Low', norm['close']: 'Close', norm['volume']: 'Volume'
+                })
+
             # Prefer Adj Close if present
             for ac in ['Adj Close', 'AdjClose', 'Adj_Close', 'Adjclose']:
                 if ac in df.columns:
                     df['Close'] = df[ac]
                     break
-            # Parse and set index
+
+            # Parse and clean
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.sort_values('Date').set_index('Date')
-            # Ensure numeric
             for c in ['Open','High','Low','Close','Volume']:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
             df = df.dropna(subset=['Open','High','Low','Close'])
-            out[ticker] = df
+            out[ticker] = df[['Open','High','Low','Close','Volume']]
         except Exception as e:
             st.error(f"Failed to parse {f.name}: {e}")
     return out
 
-# ------------------------- Fundamentals optional -------------------------
+def _aggregate_per_ticker(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Convert consolidated bhav rows into per-ticker OHLCV DataFrames."""
+    df = df.dropna(subset=["Date","Open","High","Low","Close","Volume"]).copy()
+    df.sort_values(["Ticker","Date"], inplace=True)
+    out = {}
+    for tkr, g in df.groupby("Ticker", sort=True):
+        g = g.drop_duplicates(subset=["Date"]).set_index("Date").sort_index()
+        out[tkr] = g[["Open","High","Low","Close","Volume"]]
+    return out
+
+def build_data_map_from_bhavcopy(uploaded) -> dict[str, pd.DataFrame]:
+    """
+    Accept a single NSE Equity Bhavcopy CSV or ZIP (with many daily CSVs).
+    Returns {ticker: df(Date-indexed OHLCV)} aggregated across days.
+    """
+    REQUIRED = ["SYMBOL","SERIES","OPEN","HIGH","LOW","CLOSE","TOTTRDQTY","TIMESTAMP"]
+
+    def _load_csv_bytes(b: bytes) -> pd.DataFrame:
+        df = pd.read_csv(io.BytesIO(b))
+        missing = [c for c in REQUIRED if c not in df.columns]
+        if missing:
+            raise ValueError(f"Bhav CSV missing columns: {missing}")
+        df = df[df["SERIES"] == "EQ"].copy()
+        df["Ticker"] = df["SYMBOL"].astype(str).str.strip() + ".NS"
+        df["Date"] = pd.to_datetime(df["TIMESTAMP"], dayfirst=True, errors="coerce")
+        df.rename(columns={
+            "OPEN":"Open","HIGH":"High","LOW":"Low","CLOSE":"Close","TOTTRDQTY":"Volume"
+        }, inplace=True)
+        return df[["Date","Ticker","Open","High","Low","Close","Volume"]]
+
+    if uploaded is None:
+        return {}
+
+    # Single-day CSV
+    if uploaded.name.lower().endswith(".csv"):
+        df = _load_csv_bytes(uploaded.getvalue())
+        return _aggregate_per_ticker(df)
+
+    # ZIP of many days
+    if uploaded.name.lower().endswith(".zip"):
+        frames = []
+        with zipfile.ZipFile(io.BytesIO(uploaded.getvalue()), "r") as zf:
+            for name in zf.namelist():
+                if name.lower().endswith(".csv"):
+                    b = zf.read(name)
+                    try:
+                        frames.append(_load_csv_bytes(b))
+                    except Exception as e:
+                        st.warning(f"Skipped {name}: {e}")
+        if not frames:
+            return {}
+        df = pd.concat(frames, ignore_index=True)
+        return _aggregate_per_ticker(df)
+
+    return {}
+
+# ------------------------- Fundamentals (optional) -------------------------
 fund_df = None
-if (fund_file is not None):
+if fund_file is not None:
     try:
         fund_df = pd.read_csv(fund_file)
         st.success(f'Loaded fundamentals with {fund_df.shape[0]} rows.')
@@ -123,51 +192,71 @@ if (fund_file is not None):
 # ------------------------- Universe (Live source only) -------------------------
 tickers = None
 if data_source == 'Live: Yahoo':
-    default_uni = load_default_universe('data/universe.csv')
-    pasted = locals().get('pasted', '')
-    uni_file = locals().get('uni_file', None)
+    try:
+        default_uni = load_default_universe('data/universe.csv')
+    except Exception:
+        default_uni = pd.DataFrame({"Ticker": []})
 
-    if pasted and pasted.strip():
+    if 'pasted' in locals() and pasted.strip():
         tickers = [t.strip() for t in pasted.strip().splitlines() if t.strip()]
-    elif uni_file is not None:
+    elif 'uni_file' in locals() and (uni_file is not None):
         try:
             udf = pd.read_csv(uni_file)
             col = 'Ticker' if 'Ticker' in udf.columns else udf.columns[0]
             tickers = udf[col].dropna().astype(str).str.strip().tolist()
         except Exception as e:
             st.error(f'Failed to parse uploaded universe CSV: {e}')
+            tickers = []
     else:
-        first_col = default_uni.columns[0]
-        tickers = default_uni[first_col].dropna().astype(str).str.strip().tolist()
+        if len(default_uni.columns) == 0:
+            tickers = []
+        else:
+            first_col = default_uni.columns[0]
+            tickers = default_uni[first_col].dropna().astype(str).str.strip().tolist()
 
     st.write('**Universe size:**', len(tickers), 'tickers')
 
-# ------------------------- Run -------------------------
+# ------------------------- RUN -------------------------
 if run_btn:
     with st.spinner('Fetching EoD data and computing filters...'):
-        # Choose data source
+        # Select data source
         if sanity:
-            # quick US sanity check
-            data_map = fetch_many(['AAPL', 'MSFT'], years=years, max_batch=2)
+            # small US check to diagnose Yahoo connectivity
+            try:
+                data_map = fetch_many(['AAPL', 'MSFT'], years=years, max_batch=2)
+            except TypeError:
+                # in case your fetch_many signature doesn't support max_batch/years
+                data_map = fetch_many(['AAPL', 'MSFT'])
         elif data_source == 'Live: Yahoo':
-            data_map = fetch_many(tickers, years=years, max_batch=max_batch)
-        else:
-            # CSV Manual mode
+            if not tickers:
+                st.error("Universe is empty. Add tickers or upload a universe CSV.")
+                st.stop()
+            try:
+                data_map = fetch_many(tickers, years=years, max_batch=max_batch)
+            except TypeError:
+                data_map = fetch_many(tickers)
+        elif data_source == 'Upload CSV (Manual)':
             if not csv_files:
                 st.error("Please upload at least one CSV file with columns: Date, Open, High, Low, Close, Volume.")
                 st.stop()
             data_map = build_data_map_from_csv_files(csv_files)
+        else:  # Upload NSE Bhavcopy (CSV/ZIP)
+            if 'bhav_file' not in locals() or bhav_file is None:
+                st.error("Please upload a Bhavcopy CSV or ZIP.")
+                st.stop()
+            data_map = build_data_map_from_bhavcopy(bhav_file)
 
         if not data_map:
             if data_source == 'Live: Yahoo':
                 st.error(
                     "Could not fetch data for any tickers this run (Yahoo may be rate-limiting). "
-                    "Use **Upload CSV (Manual)** mode for today, or try the Sanity Test."
+                    "Try the **Upload NSE Bhavcopy (CSV/ZIP)** source, or the **Upload CSV (Manual)** mode."
                 )
             else:
-                st.error("No valid data found in uploaded CSVs.")
+                st.error("No valid data was parsed. Please check the files and try again.")
             st.stop()
 
+        # ------------------------- Core pipeline -------------------------
         rows = []
         charts_store = {}
 
@@ -175,10 +264,12 @@ if run_btn:
             if df is None or df.empty:
                 continue
 
+            # Indicators & minimum history for signals
             feat = add_indicators(df)
-            if len(feat) < 210:
+            if len(feat) < 210:  # ~ 200 bars for EMA/52w context
                 continue
 
+            # Signals
             liquidity_ok = apply_liquidity_filter(feat, min_turnover_cr=min_turnover).iloc[-1]
             trend_ok     = apply_trend_filter(feat).iloc[-1]
             sig_breakout = breakout_volume_signal(
@@ -206,6 +297,7 @@ if run_btn:
                 '52w Low Reversal?': bool(sig_low52)
             })
 
+            # Chart
             sub = feat.tail(200)
             fig = go.Figure()
             fig.add_trace(go.Candlestick(
@@ -217,9 +309,10 @@ if run_btn:
 
         result = pd.DataFrame(rows)
         if result.empty:
-            st.warning("No valid data after filters. Try widening thresholds or supply more history.")
+            st.warning("No valid data after indicators/filters. Ensure enough history (≈250–300 trading days) and try again.")
             st.stop()
 
+        # Fundamentals (optional)
         result = merge_with_fundamentals(result, fund_df)
         if fund_df is not None and not fund_df.empty:
             result = apply_fundamental_filters(result, rules)
@@ -227,6 +320,7 @@ if run_btn:
                 st.info("All candidates were filtered out by fundamentals. Relax thresholds or remove the fundamentals file.")
                 st.stop()
 
+        # Results
         st.subheader('Scan Results')
         result_sorted = result.sort_values(by=['Passed', 'Score'], ascending=[False, False])
         st.dataframe(result_sorted, use_container_width=True, hide_index=True)
@@ -237,6 +331,7 @@ if run_btn:
             mime='text/csv'
         )
 
+        # Charts
         st.subheader('Charts (Passed Picks)')
         passed_tickers = result_sorted[result_sorted['Passed']]['Ticker'].tolist()
         if not passed_tickers:

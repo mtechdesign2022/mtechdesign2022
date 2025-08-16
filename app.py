@@ -19,7 +19,7 @@ st.set_page_config(page_title='AI Stock Selection — EoD (Enhanced)', layout='w
 st.title('🧠 AI Stock Selection — EoD (Enhanced)')
 st.caption('Breakout+Volume and 52w Low Reversal strategies, with universe overrides and optional fundamentals.')
 
-# Sidebar controls
+# ------------------------- Sidebar controls -------------------------
 with st.sidebar:
     st.header('Settings')
     years = st.slider('Years of history', 1, 5, 3)
@@ -48,17 +48,24 @@ with st.sidebar:
         'SalesGrowthYoY': st.number_input('Min Sales Growth YoY %', -100.0, 200.0, 10.0, 1.0),
         'ProfitGrowthYoY': st.number_input('Min Profit Growth YoY %', -100.0, 200.0, 10.0, 1.0),
     }
+
     st.markdown('---')
+    # NEW: limit batch size to reduce Yahoo rate limits on cold starts
+    max_batch = st.slider('Max tickers to fetch this run', 10, 100, 30, 5)
+
     run_btn = st.button('Run Scan')
 
-# Load default universe
-default_uni = pd.read_csv('data/universe.csv')
+# ------------------------- Universe loading -------------------------
+@st.cache_data(show_spinner=False)
+def load_default_universe(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
 
-# Override via paste
+default_uni = load_default_universe('data/universe.csv')
+
+# Override via paste / upload
 tickers = None
 if pasted.strip():
     tickers = [t.strip() for t in pasted.strip().splitlines() if t.strip()]
-# Override via upload
 elif uni_file is not None:
     try:
         udf = pd.read_csv(uni_file)
@@ -66,13 +73,15 @@ elif uni_file is not None:
         tickers = udf[col].dropna().astype(str).str.strip().tolist()
     except Exception as e:
         st.error(f'Failed to parse uploaded universe CSV: {e}')
+
 # Fallback to default
 if tickers is None:
-    tickers = default_uni[default_uni.columns[0]].dropna().astype(str).str.strip().tolist()
+    first_col = default_uni.columns[0]
+    tickers = default_uni[first_col].dropna().astype(str).str.strip().tolist()
 
 st.write('**Universe size:**', len(tickers), 'tickers')
 
-# Optionally load fundamentals
+# ------------------------- Fundamentals optional -------------------------
 fund_df = None
 if fund_file is not None:
     try:
@@ -81,22 +90,41 @@ if fund_file is not None:
     except Exception as e:
         st.error(f'Failed to parse fundamentals CSV: {e}')
 
+# ------------------------- Run -------------------------
 if run_btn:
     with st.spinner('Fetching EoD data and computing filters...'):
-        data_map = fetch_many(tickers, years=years)
+        # uses the updated utils/data.py with years + max_batch
+        data_map = fetch_many(tickers, years=years, max_batch=max_batch)
+
+        # If nothing fetched (Yahoo rate-limit, network, etc.)
+        if not data_map:
+            st.error(
+                "Could not fetch data for any tickers this run (Yahoo may be rate-limiting). "
+                "Try lowering **Max tickers**, then click **Run Scan** again."
+            )
+            st.stop()
 
         rows = []
         charts_store = {}
 
         for tkr, df in data_map.items():
+            # Defensive: skip if df is unexpectedly empty
+            if df is None or df.empty:
+                continue
+
             feat = add_indicators(df)
+            # need enough history for indicators (EMA200, 52w)
             if len(feat) < 210:
                 continue
 
             liquidity_ok = apply_liquidity_filter(feat, min_turnover_cr=min_turnover).iloc[-1]
             trend_ok     = apply_trend_filter(feat).iloc[-1]
-            sig_breakout = breakout_volume_signal(feat, breakout_window=breakout_window, vol_mult=vol_mult).iloc[-1] if use_breakout else False
-            sig_low52    = low52_reversal_signal(feat, min_above=low52_min, max_above=low52_max).iloc[-1] if use_low52 else False
+            sig_breakout = breakout_volume_signal(
+                feat, breakout_window=breakout_window, vol_mult=vol_mult
+            ).iloc[-1] if use_breakout else False
+            sig_low52    = low52_reversal_signal(
+                feat, min_above=low52_min, max_above=low52_max
+            ).iloc[-1] if use_low52 else False
 
             passed = bool(liquidity_ok and trend_ok and (sig_breakout or sig_low52))
             score = float(compute_score(feat).iloc[-1])
@@ -116,22 +144,40 @@ if run_btn:
                 '52w Low Reversal?': bool(sig_low52)
             })
 
+            # Small recent window chart
             sub = feat.tail(200)
             fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=sub.index, open=sub['Open'], high=sub['High'], low=sub['Low'], close=sub['Close'], name='Price'))
+            fig.add_trace(go.Candlestick(
+                x=sub.index, open=sub['Open'], high=sub['High'], low=sub['Low'], close=sub['Close'], name='Price'
+            ))
             fig.add_trace(go.Scatter(x=sub.index, y=sub['Ema50'], name='EMA50'))
             fig.add_trace(go.Scatter(x=sub.index, y=sub['Ema200'], name='EMA200'))
             charts_store[tkr] = fig
 
         result = pd.DataFrame(rows)
+
+        # If rows empty after all filters, stop gracefully
+        if result.empty:
+            st.warning("No valid data after filters. Try widening thresholds or reduce max tickers and re-run.")
+            st.stop()
+
+        # Merge & apply fundamentals if provided
         result = merge_with_fundamentals(result, fund_df)
         if fund_df is not None and not fund_df.empty:
             result = apply_fundamental_filters(result, rules)
+            if result.empty:
+                st.info("All candidates were filtered out by fundamentals. Relax thresholds or remove the fundamentals file.")
+                st.stop()
 
         st.subheader('Scan Results')
-        result_sorted = result.sort_values(by=['Passed','Score'], ascending=[False, False])
+        result_sorted = result.sort_values(by=['Passed', 'Score'], ascending=[False, False])
         st.dataframe(result_sorted, use_container_width=True, hide_index=True)
-        st.download_button('Download CSV', result_sorted.to_csv(index=False).encode('utf-8'), file_name='scan_results.csv', mime='text/csv')
+        st.download_button(
+            'Download CSV',
+            result_sorted.to_csv(index=False).encode('utf-8'),
+            file_name='scan_results.csv',
+            mime='text/csv'
+        )
 
         st.subheader('Charts (Passed Picks)')
         passed_tickers = result_sorted[result_sorted['Passed']]['Ticker'].tolist()

@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from io import StringIO
 
 # Ensure local modules are importable on Streamlit Cloud
 import sys, os
@@ -21,8 +22,15 @@ st.caption('Breakout+Volume and 52w Low Reversal strategies, with universe overr
 
 # ------------------------- Sidebar controls -------------------------
 with st.sidebar:
+    st.header('Data Source')
+    data_source = st.radio(
+        'Choose',
+        options=['Live: Yahoo', 'Upload CSV (Manual)'],
+        index=0
+    )
+
     st.header('Settings')
-    years = st.slider('Years of history', 1, 5, 3)
+    years = st.slider('Years of history (Live)', 1, 5, 3)
     min_turnover = st.number_input('Min avg turnover (₹ Cr, 5-day)', min_value=0.0, value=5.0, step=0.5)
 
     st.subheader('Strategies')
@@ -35,9 +43,15 @@ with st.sidebar:
     low52_max = st.slider('Max % above 52w low', 0.05, 0.50, 0.20, 0.01)
 
     st.markdown('---')
-    st.subheader('Universe (override)')
-    pasted = st.text_area('Paste tickers (one per line, e.g., RELIANCE.NS)', value='')
-    uni_file = st.file_uploader('Or upload a CSV with a "Ticker" column', type=['csv'])
+    if data_source == 'Live: Yahoo':
+        st.subheader('Universe (override)')
+        pasted = st.text_area('Paste tickers (one per line, e.g., RELIANCE.NS)', value='')
+        uni_file = st.file_uploader('Or upload a CSV with a "Ticker" column', type=['csv'])
+        max_batch = st.slider('Max tickers to fetch this run', 5, 100, 15, 5)
+    else:
+        st.subheader('Upload one CSV per ticker')
+        st.caption('Each file must have columns: Date, Open, High, Low, Close, Volume')
+        csv_files = st.file_uploader('Upload CSV files', type=['csv'], accept_multiple_files=True)
 
     st.markdown('---')
     st.subheader('Fundamental Filters (optional)')
@@ -50,70 +64,118 @@ with st.sidebar:
     }
 
     st.markdown('---')
-    # NEW: limit batch size to reduce Yahoo rate limits on cold starts
-    max_batch = st.slider('Max tickers to fetch this run', 10, 100, 30, 5)
-
+    sanity = st.checkbox('Run sanity test with AAPL, MSFT (ignores universe settings)')
     run_btn = st.button('Run Scan')
 
-# ------------------------- Universe loading -------------------------
+# ------------------------- Helpers -------------------------
 @st.cache_data(show_spinner=False)
 def load_default_universe(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
-default_uni = load_default_universe('data/universe.csv')
-
-# Override via paste / upload
-tickers = None
-if pasted.strip():
-    tickers = [t.strip() for t in pasted.strip().splitlines() if t.strip()]
-elif uni_file is not None:
-    try:
-        udf = pd.read_csv(uni_file)
-        col = 'Ticker' if 'Ticker' in udf.columns else udf.columns[0]
-        tickers = udf[col].dropna().astype(str).str.strip().tolist()
-    except Exception as e:
-        st.error(f'Failed to parse uploaded universe CSV: {e}')
-
-# Fallback to default
-if tickers is None:
-    first_col = default_uni.columns[0]
-    tickers = default_uni[first_col].dropna().astype(str).str.strip().tolist()
-
-st.write('**Universe size:**', len(tickers), 'tickers')
+def build_data_map_from_csv_files(files) -> dict[str, pd.DataFrame]:
+    """
+    Accepts a list of uploaded CSV files. Returns {ticker: df} dict.
+    The ticker name is derived from the filename (before .csv).
+    Required cols: Date, Open, High, Low, Close, Volume.
+    """
+    out = {}
+    for f in files:
+        try:
+            name = f.name
+            ticker = os.path.splitext(name)[0]
+            df = pd.read_csv(f)
+            # Normalize columns
+            cols = {c.strip().lower(): c for c in df.columns}
+            need = ['date','open','high','low','close','volume']
+            if not all(c in [x.strip().lower() for x in df.columns] for c in ['Date','Open','High','Low','Close','Volume']):
+                # try to map lower-case keys
+                if not all(k in cols for k in need):
+                    st.warning(f"{name}: missing required columns. Found {list(df.columns)}")
+                    continue
+                df = df.rename(columns={cols['date']: 'Date', cols['open']: 'Open', cols['high']: 'High',
+                                        cols['low']: 'Low', cols['close']: 'Close', cols['volume']: 'Volume'})
+            # Prefer Adj Close if present
+            for ac in ['Adj Close', 'AdjClose', 'Adj_Close', 'Adjclose']:
+                if ac in df.columns:
+                    df['Close'] = df[ac]
+                    break
+            # Parse and set index
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.sort_values('Date').set_index('Date')
+            # Ensure numeric
+            for c in ['Open','High','Low','Close','Volume']:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+            df = df.dropna(subset=['Open','High','Low','Close'])
+            out[ticker] = df
+        except Exception as e:
+            st.error(f"Failed to parse {f.name}: {e}")
+    return out
 
 # ------------------------- Fundamentals optional -------------------------
 fund_df = None
-if fund_file is not None:
+if (fund_file is not None):
     try:
         fund_df = pd.read_csv(fund_file)
         st.success(f'Loaded fundamentals with {fund_df.shape[0]} rows.')
     except Exception as e:
         st.error(f'Failed to parse fundamentals CSV: {e}')
 
+# ------------------------- Universe (Live source only) -------------------------
+tickers = None
+if data_source == 'Live: Yahoo':
+    default_uni = load_default_universe('data/universe.csv')
+    pasted = locals().get('pasted', '')
+    uni_file = locals().get('uni_file', None)
+
+    if pasted and pasted.strip():
+        tickers = [t.strip() for t in pasted.strip().splitlines() if t.strip()]
+    elif uni_file is not None:
+        try:
+            udf = pd.read_csv(uni_file)
+            col = 'Ticker' if 'Ticker' in udf.columns else udf.columns[0]
+            tickers = udf[col].dropna().astype(str).str.strip().tolist()
+        except Exception as e:
+            st.error(f'Failed to parse uploaded universe CSV: {e}')
+    else:
+        first_col = default_uni.columns[0]
+        tickers = default_uni[first_col].dropna().astype(str).str.strip().tolist()
+
+    st.write('**Universe size:**', len(tickers), 'tickers')
+
 # ------------------------- Run -------------------------
 if run_btn:
     with st.spinner('Fetching EoD data and computing filters...'):
-        # uses the updated utils/data.py with years + max_batch
-        data_map = fetch_many(tickers, years=years, max_batch=max_batch)
+        # Choose data source
+        if sanity:
+            # quick US sanity check
+            data_map = fetch_many(['AAPL', 'MSFT'], years=years, max_batch=2)
+        elif data_source == 'Live: Yahoo':
+            data_map = fetch_many(tickers, years=years, max_batch=max_batch)
+        else:
+            # CSV Manual mode
+            if not csv_files:
+                st.error("Please upload at least one CSV file with columns: Date, Open, High, Low, Close, Volume.")
+                st.stop()
+            data_map = build_data_map_from_csv_files(csv_files)
 
-        # If nothing fetched (Yahoo rate-limit, network, etc.)
         if not data_map:
-            st.error(
-                "Could not fetch data for any tickers this run (Yahoo may be rate-limiting). "
-                "Try lowering **Max tickers**, then click **Run Scan** again."
-            )
+            if data_source == 'Live: Yahoo':
+                st.error(
+                    "Could not fetch data for any tickers this run (Yahoo may be rate-limiting). "
+                    "Use **Upload CSV (Manual)** mode for today, or try the Sanity Test."
+                )
+            else:
+                st.error("No valid data found in uploaded CSVs.")
             st.stop()
 
         rows = []
         charts_store = {}
 
         for tkr, df in data_map.items():
-            # Defensive: skip if df is unexpectedly empty
             if df is None or df.empty:
                 continue
 
             feat = add_indicators(df)
-            # need enough history for indicators (EMA200, 52w)
             if len(feat) < 210:
                 continue
 
@@ -144,7 +206,6 @@ if run_btn:
                 '52w Low Reversal?': bool(sig_low52)
             })
 
-            # Small recent window chart
             sub = feat.tail(200)
             fig = go.Figure()
             fig.add_trace(go.Candlestick(
@@ -155,13 +216,10 @@ if run_btn:
             charts_store[tkr] = fig
 
         result = pd.DataFrame(rows)
-
-        # If rows empty after all filters, stop gracefully
         if result.empty:
-            st.warning("No valid data after filters. Try widening thresholds or reduce max tickers and re-run.")
+            st.warning("No valid data after filters. Try widening thresholds or supply more history.")
             st.stop()
 
-        # Merge & apply fundamentals if provided
         result = merge_with_fundamentals(result, fund_df)
         if fund_df is not None and not fund_df.empty:
             result = apply_fundamental_filters(result, rules)

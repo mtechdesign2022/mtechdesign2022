@@ -3,6 +3,10 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
+# Ensure local modules are importable on Streamlit Cloud
+import sys, os
+sys.path.append(os.path.dirname(__file__))
+
 from utils.data import fetch_many
 from utils.indicators import add_indicators
 from utils.filters import (
